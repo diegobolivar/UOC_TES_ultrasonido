@@ -1,0 +1,464 @@
+/*Entrega V9 - 20180607 1400
+ *
+ *Modificacion de  impresion de datos para linealizacion de sensores de distancia
+ *
+ * Grafica los Datos en Excel usuando PLX - DAQ
+ * 
+ *  Modulo Ultrasonido HC-SC04
+ *  Modulo Acelerometro y Giroscopio GY-87
+ *  Modulo Bluetooth HC-10
+ *
+ * ---------------------     ---------------------     ---------------------
+ * | HC-SC04 | Arduino |     |   GY-87 | Arduino |     |  HC-05  | Arduino |
+ * ---------------------     ---------------------     ---------------------
+ * |   Vcc   |   5V    |     |   Vcc   |   5V    |     |   Vcc   |   5V    |
+ * |   Trig  |   12    |  Y  |   Gnd   |   GND   |  Y  |   Gnd   |   GND   |
+ * |   Echo  |   13    |     |   SDA   | Ping A4 |     |   TX    |   10    |
+ * |   Gnd   |   GND   |     |   SCL   | Ping A5 |     |   RX    |   11    |
+ * ---------------------     ---------------------     ---------------------
+ *
+ * Pines Sensor HC-SC04 Vector Z
+ * 13 TRIG_z
+ * 12 ECHO_z
+ * Pines Sensor HC-SC04 Vector +X
+ * 3 TRIG_xp 
+ * 2 ECHO_xp 
+ * Pines Sensor HC-SC04 Vector -X
+ * 9 TRIG_xn
+ * 8 ECHO_xn
+ * Pines Sensor HC-SC04 Vector +Y
+ * 7 TRIG_yp
+ * 6 ECHO_yp
+ * Pines Sensor HC-SC04 Vector -Y
+ * 5 TRIG_yn
+ * 4 ECHO_yn
+ * 
+ */
+
+#include "I2Cdev.h"
+#include "MPU6050.h"
+#include "Wire.h"
+#include <SoftwareSerial.h>   // Incluimos la librería  SoftwareSerial  
+#include <Ultrasonic.h>
+#include <TimeLib.h> //Incluimos la librería Time
+#include <Wire.h>
+#include <Kalman.h> // Source: https://github.com/TKJElectronics/KalmanFilter
+
+
+
+Ultrasonic ultrasonic_z(13, 12);  // An ultrasonic sensor HC-04
+Ultrasonic ultrasonic_xp(3, 2); // An ultrasonic sensor HC-04
+Ultrasonic ultrasonic_xn(9, 8);  // An ultrasonic sensor HC-04
+Ultrasonic ultrasonic_yp(7, 6);  // An ultrasonic sensor HC-04
+Ultrasonic ultrasonic_yn(5, 4);  // An ultrasonic sensor HC-04
+SoftwareSerial BT(10,11);    // Definimos los pines RX y TX del Arduino conectados al Bluetooth
+
+
+// Definicion de variables de Modulo de compensacion de Acelerometro y Giroscopio
+const int mpuAddress = 0x68;  // Puede ser 0x68 o 0x69
+MPU6050 mpu(mpuAddress);
+ 
+int ax, ay, az;
+int gx, gy, gz;
+
+//int t;
+ 
+long tiempo_prev;
+float dt;
+float ang_x, ang_y;
+float ang_x_prev, ang_y_prev;
+
+
+#define RESTRICT_PITCH // Comment out to restrict roll to ±90deg instead - please read: http://www.freescale.com/files/sensors/doc/app_note/AN3461.pdf
+
+Kalman kalmanX; // Create the Kalman instances
+Kalman kalmanY;
+
+/* IMU Data */
+double accX, accY, accZ;
+double gyroX, gyroY, gyroZ;
+int16_t tempRaw;
+
+double gyroXangle, gyroYangle; // Angle calculate using the gyro only - Calculo de angulo usando solo el giroscopio
+double compAngleX, compAngleY; // Calculated angle using a complementary filter - Calculo de angulo usando filtro complementario
+double kalAngleX, kalAngleY; // Calculated angle using a Kalman filter - Calculo de angulo usando filtro Kalman
+
+uint32_t timer;
+uint8_t i2cData[14]; // Buffer for I2C data
+
+const uint8_t IMUAddress = 0x68; // AD0 is logic low on the PCB
+const uint16_t I2C_TIMEOUT = 1000; // Used to check for errors in I2C communication
+
+
+void ActualizacionFiltro()
+{
+   dt = (millis() - tiempo_prev) / 1000.0;
+   tiempo_prev = millis();
+ 
+   //Calcular los ángulos con acelerometro
+   float accel_ang_x = atan(ay / sqrt(pow(ax, 2) + pow(az, 2)))*(180.0 / 3.14);
+   float accel_ang_y = atan(-ax / sqrt(pow(ay, 2) + pow(az, 2)))*(180.0 / 3.14);
+
+   //Calcular angulo de rotación con giroscopio y filtro complementario
+   ang_x = 0.98*(ang_x_prev + (gx / 131)*dt) + 0.02*accel_ang_x;
+   ang_y = 0.98*(ang_y_prev + (gy / 131)*dt) + 0.02*accel_ang_y;
+ 
+   ang_x_prev = ang_x;
+   ang_y_prev = ang_y;
+}
+
+//-------- i2c-------------------
+
+
+uint8_t i2cWrite(uint8_t registerAddress, uint8_t data, bool sendStop) {
+  return i2cWrite(registerAddress, &data, 1, sendStop); // Returns 0 on success
+}
+
+uint8_t i2cWrite(uint8_t registerAddress, uint8_t *data, uint8_t length, bool sendStop) {
+  Wire.beginTransmission(IMUAddress);
+  Wire.write(registerAddress);
+  Wire.write(data, length);
+  uint8_t rcode = Wire.endTransmission(sendStop); // Returns 0 on success
+  if (rcode) {
+    Serial.print(F("i2cWrite failed: "));
+    Serial.println(rcode);
+  }
+  return rcode; // See: http://arduino.cc/en/Reference/WireEndTransmission
+}
+
+uint8_t i2cRead(uint8_t registerAddress, uint8_t *data, uint8_t nbytes) {
+  uint32_t timeOutTimer;
+  Wire.beginTransmission(IMUAddress);
+  Wire.write(registerAddress);
+  uint8_t rcode = Wire.endTransmission(false); // Don't release the bus
+  if (rcode) {
+    Serial.print(F("i2cRead failed: "));
+    Serial.println(rcode);
+    return rcode; // See: http://arduino.cc/en/Reference/WireEndTransmission
+  }
+  Wire.requestFrom(IMUAddress, nbytes, (uint8_t)true); // Send a repeated start and then release the bus after reading
+  for (uint8_t i = 0; i < nbytes; i++) {
+    if (Wire.available())
+      data[i] = Wire.read();
+    else {
+      timeOutTimer = micros();
+      while (((micros() - timeOutTimer) < I2C_TIMEOUT) && !Wire.available());
+      if (Wire.available())
+        data[i] = Wire.read();
+      else {
+        Serial.println(F("i2cRead timeout"));
+        return 5; // This error value is not already taken by endTransmission
+      }
+    }
+  }
+  return 0; // Success
+}
+
+//-------fin i2c-------------------------
+
+
+
+void setup() {
+   BT.begin(9600);       // Inicializamos el puerto serie BT (Para Modo AT 2)
+  // BT.begin(115200);       // Inicializamos el puerto serie BT (Para Modo AT 2)
+   BT.println("CLEARDATA"); 
+   BT.println("LABEL,Tiempo,Periodo,Z, +X, -X, +Y, -Y, Rotacion en X, Ratacion en Y,accX,accY,accZ,gyroX,gyroY,gyroZ,roll,gyroXangle,compAngleX,kalAngleX,pitch,gyroYangle,compAngleY,kalAngleY,temperatura");
+// Serial.begin(9600);
+   Serial.begin(115200);
+//   Serial.begin(128000);
+   Serial.println("CLEARDATA"); 
+   Serial.println("LABEL,Tiempo,Periodo,Z, +X, -X, +Y, -Y, Rotacion en X, Ratacion en Y,accX,accY,accZ,gyroX,gyroY,gyroZ,roll,gyroXangle,compAngleX,kalAngleX,pitch,gyroYangle,compAngleY,kalAngleY,temperatura");
+
+   setTime(00,00,00,6,7,2018); // Las 00:00:00 del dia 6 de Julio de 2018
+
+   
+/*
+   Wire.begin();
+   mpu.initialize();
+  Serial.println(mpu.testConnection() ? F("IMU iniciado correctamente") : F("Error al iniciar IMU"));
+  BT.println(mpu.testConnection() ? F("IMU iniciado correctamente") : F("Error al iniciar IMU"));
+*/
+
+// TODO: Hace Rutina de Calibracion
+
+ // Serial.begin(115200);
+  Wire.begin();
+#if ARDUINO >= 157
+  Wire.setClock(400000UL); // Set I2C frequency to 400kHz
+#else
+  TWBR = ((F_CPU / 400000UL) - 16) / 2; // Set I2C frequency to 400kHz
+#endif
+
+  i2cData[0] = 7; // Set the sample rate to 1000Hz - 8kHz/(7+1) = 1000Hz
+  i2cData[1] = 0x00; // Disable FSYNC and set 260 Hz Acc filtering, 256 Hz Gyro filtering, 8 KHz sampling
+  i2cData[2] = 0x00; // Set Gyro Full Scale Range to ±250deg/s
+  i2cData[3] = 0x00; // Set Accelerometer Full Scale Range to ±2g
+  while (i2cWrite(0x19, i2cData, 4, false)); // Write to all four registers at once
+  while (i2cWrite(0x6B, 0x01, true)); // PLL with X axis gyroscope reference and disable sleep mode
+
+  while (i2cRead(0x75, i2cData, 1));
+  if (i2cData[0] != 0x68) { // Read "WHO_AM_I" register
+    Serial.print(F("Error reading sensor"));
+    while (1);
+  }
+
+  delay(100); // Wait for sensor to stabilize
+
+  /* Set kalman and gyro starting angle */
+  while (i2cRead(0x3B, i2cData, 6));
+  accX = (int16_t)((i2cData[0] << 8) | i2cData[1]);
+  accY = (int16_t)((i2cData[2] << 8) | i2cData[3]);
+  accZ = (int16_t)((i2cData[4] << 8) | i2cData[5]);
+
+  // Source: http://www.freescale.com/files/sensors/doc/app_note/AN3461.pdf eq. 25 and eq. 26
+  // atan2 outputs the value of -p to p (radians) - see http://en.wikipedia.org/wiki/Atan2
+  // It is then converted from radians to degrees
+#ifdef RESTRICT_PITCH // Eq. 25 and 26
+  double roll  = atan2(accY, accZ) * RAD_TO_DEG;
+  double pitch = atan(-accX / sqrt(accY * accY + accZ * accZ)) * RAD_TO_DEG;
+#else // Eq. 28 and 29
+  double roll  = atan(accY / sqrt(accX * accX + accZ * accZ)) * RAD_TO_DEG;
+  double pitch = atan2(-accX, accZ) * RAD_TO_DEG;
+#endif
+
+  kalmanX.setAngle(roll); // Set starting angle
+  kalmanY.setAngle(pitch);
+  gyroXangle = roll;
+  gyroYangle = pitch;
+  compAngleX = roll;
+  compAngleY = pitch;
+
+  timer = micros();
+}
+
+
+void loop() {
+
+  time_t t = now();
+
+  
+   
+  
+  Serial.print("DATA,TIME,");
+  //Serial.print(day(t)); Serial.print(+ "/"); Serial.print(month(t)); Serial.print(+ "/"); Serial.print(year(t)); 
+  //Serial.print( ",");
+  Serial.print(hour(t)); Serial.print(+ ":"); Serial.print(minute(t)); Serial.print(":"); Serial.print(second(t));
+  Serial.print( ",");
+ 
+#if 0 // Seleccione 1 para imprimir los calculos de las distancias
+  Serial.print(ultrasonic_z.distanceRead()); // Muestra la distancia con unidad en (centimeters) en Z
+  Serial.print(",");
+  Serial.print(ultrasonic_xp.distanceRead()); // Muestra la distancia con unidad en (centimeters) en +X
+  Serial.print(",");
+  Serial.print(ultrasonic_xn.distanceRead()); // Muestra la distancia con unidad en (centimeters) en -X
+  Serial.print(",");
+  Serial.print(ultrasonic_yp.distanceRead()); // Muestra la distancia con unidad en (centimeters) en +Y
+  Serial.print(",");
+  Serial.print(ultrasonic_yn.distanceRead()); // Muestra la distancia con unidad en (centimeters) en -Y 
+  Serial.print(",");
+#endif
+
+  //BT.print("DATA,TIME,");
+  //BT.print(day(t)); BT.print(+ "/"); BT.print(month(t)); BT.print(+ "/"); BT.print(year(t)); 
+  //BT.print( ",");
+  BT.print(hour(t)); BT.print(+ ":"); BT.print(minute(t)); BT.print(":"); BT.print(second(t));
+  BT.print( ",");
+
+#if 1 // Seleccione 1 para imprimir los calculos de las distancias
+  
+  BT.print( "Dis_Z:");BT.print( ",");
+  BT.print(ultrasonic_z.distanceRead()); // Muestra la distancia con unidad en (centimeters) en Z
+  BT.print(",");
+  BT.print( "Dis_X:");BT.print( ",");
+  BT.print(ultrasonic_xp.distanceRead()); // Muestra la distancia con unidad en (centimeters) en +X
+  BT.print(",");
+  BT.print( "Dis_-X:");BT.print( ",");
+  BT.print(ultrasonic_xn.distanceRead()); // Muestra la distancia con unidad en (centimeters) en -X
+  BT.print(",");
+  BT.print( "Dis_Y:");BT.print( ",");
+  BT.print(ultrasonic_yp.distanceRead()); // Muestra la distancia con unidad en (centimeters) en +Y
+  BT.print(",");
+  BT.print( "Dis_-Y:");BT.print( ",");
+  BT.print(ultrasonic_yn.distanceRead()); // Muestra la distancia con unidad en (centimeters) en -Y 
+  BT.print(",");
+
+
+#endif
+
+    // Leer las aceleraciones y velocidades angulares
+   mpu.getAcceleration(&ax, &ay, &az);
+   mpu.getRotation(&gx, &gy, &gz);
+ 
+   ActualizacionFiltro();
+#if 0 // Seleccione 1 para imprimir los calculos de angulos de rotacion con giroscopio y filtro complemantario
+ 
+  //Serial.print(F("Rotacion en X:  ")); 
+   Serial.print(ang_x); // Pitch (cabeceo)
+   Serial.print(",");  
+   //Serial.print(F("\t Rotacion en Y: "));
+   Serial.print(ang_y); // Roll (Rodar)
+   Serial.print(",");
+
+   BT.print( "Pitch_ang_x:");BT.print( ","); 
+   BT.print(ang_x); // Pitch (cabeceo)
+   BT.print(","); 
+   BT.print( "Roll_ang_y:");BT.print( ","); 
+   BT.print(ang_y); // Roll (Rodar)
+   BT.print(",");
+#endif
+
+
+//-----------------------------------------
+
+ /* Update all the values */
+  while (i2cRead(0x3B, i2cData, 14));
+  accX = (int16_t)((i2cData[0] << 8) | i2cData[1]);
+  accY = (int16_t)((i2cData[2] << 8) | i2cData[3]);
+  accZ = (int16_t)((i2cData[4] << 8) | i2cData[5]);
+  tempRaw = (int16_t)((i2cData[6] << 8) | i2cData[7]);
+  gyroX = (int16_t)((i2cData[8] << 8) | i2cData[9]);
+  gyroY = (int16_t)((i2cData[10] << 8) | i2cData[11]);
+  gyroZ = (int16_t)((i2cData[12] << 8) | i2cData[13]);;
+
+  double dt = (double)(micros() - timer) / 1000000; // Calculate delta time
+  timer = micros();
+
+  // Source: http://www.freescale.com/files/sensors/doc/app_note/AN3461.pdf eq. 25 and eq. 26
+  // atan2 outputs the value of -p to p (radians) - see http://en.wikipedia.org/wiki/Atan2
+  // It is then converted from radians to degrees
+#ifdef RESTRICT_PITCH // Eq. 25 and 26
+  double roll  = atan2(accY, accZ) * RAD_TO_DEG;
+  double pitch = atan(-accX / sqrt(accY * accY + accZ * accZ)) * RAD_TO_DEG;
+#else // Eq. 28 and 29
+  double roll  = atan(accY / sqrt(accX * accX + accZ * accZ)) * RAD_TO_DEG;
+  double pitch = atan2(-accX, accZ) * RAD_TO_DEG;
+#endif
+
+  double gyroXrate = gyroX / 131.0; // Convert to deg/s
+  double gyroYrate = gyroY / 131.0; // Convert to deg/s
+
+#ifdef RESTRICT_PITCH
+  // This fixes the transition problem when the accelerometer angle jumps between -180 and 180 degrees
+  if ((roll < -90 && kalAngleX > 90) || (roll > 90 && kalAngleX < -90)) {
+    kalmanX.setAngle(roll);
+    compAngleX = roll;
+    kalAngleX = roll;
+    gyroXangle = roll;
+  } else
+    kalAngleX = kalmanX.getAngle(roll, gyroXrate, dt); // Calculate the angle using a Kalman filter
+
+  if (abs(kalAngleX) > 90)
+    gyroYrate = -gyroYrate; // Invert rate, so it fits the restriced accelerometer reading
+  kalAngleY = kalmanY.getAngle(pitch, gyroYrate, dt);
+#else
+  // This fixes the transition problem when the accelerometer angle jumps between -180 and 180 degrees
+  if ((pitch < -90 && kalAngleY > 90) || (pitch > 90 && kalAngleY < -90)) {
+    kalmanY.setAngle(pitch);
+    compAngleY = pitch;
+    kalAngleY = pitch;
+    gyroYangle = pitch;
+  } else
+    kalAngleY = kalmanY.getAngle(pitch, gyroYrate, dt); // Calculate the angle using a Kalman filter
+
+  if (abs(kalAngleY) > 90)
+    gyroXrate = -gyroXrate; // Invert rate, so it fits the restriced accelerometer reading
+  kalAngleX = kalmanX.getAngle(roll, gyroXrate, dt); // Calculate the angle using a Kalman filter
+#endif
+
+  gyroXangle += gyroXrate * dt; // Calculate gyro angle without any filter
+  gyroYangle += gyroYrate * dt;
+  //gyroXangle += kalmanX.getRate() * dt; // Calculate gyro angle using the unbiased rate
+  //gyroYangle += kalmanY.getRate() * dt;
+
+  compAngleX = 0.93 * (compAngleX + gyroXrate * dt) + 0.07 * roll; // Calculate the angle using a Complimentary filter
+  compAngleY = 0.93 * (compAngleY + gyroYrate * dt) + 0.07 * pitch;
+
+  // Reset the gyro angle when it has drifted too much
+  if (gyroXangle < -180 || gyroXangle > 180)
+    gyroXangle = kalAngleX;
+  if (gyroYangle < -180 || gyroYangle > 180)
+    gyroYangle = kalAngleY;
+
+  /* Print Data */
+#if 0 // Seleccione 1 para activar
+  Serial.print(accX); Serial.print(",");
+  Serial.print(accY); Serial.print(",");
+  Serial.print(accZ); Serial.print(",");
+
+  BT.print( "accX:");BT.print( ","); 
+  BT.print(accX); BT.print(",");
+  BT.print( "accY:");BT.print( ",");
+  BT.print(accY); BT.print(",");
+  BT.print( "accZ:");BT.print( ",");
+  BT.print(accZ); BT.print(",");
+
+  Serial.print(gyroX); Serial.print(",");
+  Serial.print(gyroY); Serial.print(",");
+  Serial.print(gyroZ); Serial.print(",");
+
+  BT.print( "gyroX:");BT.print( ",");
+  BT.print(gyroX); BT.print(",");
+  BT.print( "gyroY:");BT.print( ",");
+  BT.print(gyroY); BT.print(",");
+  BT.print( "gyroZ:");BT.print( ",");
+  BT.print(gyroZ); BT.print(",");
+  
+
+  //Serial.print("\t\t");
+#endif
+
+//============
+
+#if 1 // Seleccione 1 para activar
+
+  Serial.print(roll); Serial.print(",");
+  Serial.print(gyroXangle); Serial.print(",");
+  Serial.print(compAngleX); Serial.print(",");
+  Serial.print(kalAngleX); Serial.print(",");
+
+
+  BT.print( "roll:");BT.print( ",");
+  BT.print(roll); BT.print(",");
+ // BT.print( "gyroXangle:");BT.print( ",");
+ // BT.print(gyroXangle); BT.print(",");
+  BT.print( "compAngleX:");BT.print( ",");
+  BT.print(compAngleX); BT.print(",");
+  BT.print( "kalAngleX:");BT.print( ",");
+  BT.print(kalAngleX); BT.print(",");
+
+  //Serial.print(" ");
+
+  Serial.print(pitch); Serial.print(",");
+  Serial.print(gyroYangle); Serial.print(",");
+  Serial.print(compAngleY); Serial.print(",");
+  Serial.print(kalAngleY); Serial.print(",");
+
+  BT.print( "pitch:");BT.print( ",");
+  BT.print(pitch); BT.print(",");
+ // BT.print( "gyroYangle:");BT.print( ",");
+ // BT.print(gyroYangle); BT.print(",");
+  BT.print( "compAngleY:");BT.print( ",");
+  BT.print(compAngleY); BT.print(",");
+  BT.print( "kalAngleY:");BT.print( ",");
+  BT.print(kalAngleY); BT.print(",");
+
+#endif
+
+
+#if 0 // Seleccione 1 para imprimir la temperatura
+  //Serial.print(" ");
+
+  double temperature = (double)tempRaw / 340.0 + 36.53;
+  Serial.println(temperature); //Serial.print(",");
+  BT.print( "temp:");BT.print( ",");
+  BT.println(temperature); //BT.print(",");
+#endif
+
+//  Serial.print("\r\n");
+
+ BT.println( " ");
+ Serial.println( " ");
+  
+  delay(2);
+
+}
